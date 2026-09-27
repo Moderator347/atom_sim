@@ -1,0 +1,6 @@
+fastapi>=0.116,<1.0
+uvicorn>=0.35,<1.0
+ase>=3.24
+numpy>=2.0
+scipy>=1.14
+pydantic>=2.9,<3.0
