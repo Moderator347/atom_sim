@@ -4,3 +4,4 @@ ase>=3.24
 numpy>=2.0
 scipy>=1.14
 pydantic>=2.9,<3.0
+torch>=2.0
