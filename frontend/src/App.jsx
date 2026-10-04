@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import { Canvas } from '@react-three/fiber'
 import { OrbitControls, Sphere, Cylinder } from '@react-three/drei'
 import axios from 'axios'
@@ -20,20 +20,8 @@ const ELEMENT_COLORS = {
 
 const EXTRA_ELEMENTS = ['O', 'N', 'H', 'S', 'Zn', 'Ni', 'Co', 'Ca']
 
-// Подсветка атома — каркасная сфера вокруг выделенного атома
-function Highlight({ position, color }) {
-  return (
-    <group position={position}>
-      <mesh>
-        <sphereGeometry args={[0.55, 16, 16]} />
-        <meshBasicMaterial color={color} wireframe transparent opacity={0.6} />
-      </mesh>
-    </group>
-  )
-}
-
 // Компонент атома
-function Atom({ position, color, clipPlanes, radius = 0.35, onClick, selected }) {
+function Atom({ position, color, clipPlanes, radius = 0.35, onClick, selected, substituted }) {
   return (
     <group position={position}>
       <Sphere
@@ -50,14 +38,21 @@ function Atom({ position, color, clipPlanes, radius = 0.35, onClick, selected })
           clipShadows={true}
         />
       </Sphere>
+      {/* Каркасная оболочка у замещённых/добавленных атомов */}
+      {(substituted || selected) && (
+        <mesh>
+          <sphereGeometry args={[radius * 1.5, 14, 14]} />
+          <meshBasicMaterial color={substituted ? '#ffd700' : '#ff1493'} wireframe transparent opacity={0.55} />
+        </mesh>
+      )}
     </group>
   )
 }
 
 // Компонент связи (цилиндр между двумя атомами)
 function Bond({ atom1, atom2, clipPlanes, bondColor, highlighted }) {
-  const start = new THREE.Vector3(atom1.x, atom1.y, atom1.z)
-  const end = new THREE.Vector3(atom2.x, atom2.y, atom2.z)
+  const start = useMemo(() => new THREE.Vector3(atom1.x, atom1.y, atom1.z), [atom1])
+  const end = useMemo(() => new THREE.Vector3(atom2.x, atom2.y, atom2.z), [atom2])
 
   const distance = start.distanceTo(end)
   const direction = new THREE.Vector3().subVectors(end, start)
@@ -66,14 +61,14 @@ function Bond({ atom1, atom2, clipPlanes, bondColor, highlighted }) {
   const quaternion = useMemo(() => {
     const axis = new THREE.Vector3(0, 1, 0)
     const q = new THREE.Quaternion()
-    q.setFromUnitVectors(axis, direction.clone().normalize())
+    if (direction.lengthSq() > 1e-12) q.setFromUnitVectors(axis, direction.clone().normalize())
     return q
   }, [direction])
 
   return (
     <group position={midpoint} quaternion={quaternion}>
       <Cylinder
-        args={[highlighted ? 0.13 : 0.08, highlighted ? 0.13 : 0.08, distance, 8]}
+        args={[highlighted ? 0.13 : 0.08, highlighted ? 0.13 : 0.08, Math.max(distance, 0.01), 8]}
         rotation={[Math.PI / 2, 0, 0]}
       >
         <meshStandardMaterial
@@ -104,30 +99,32 @@ function ClippingPlane({ axis, position }) {
     return [0, 0, position]
   }, [axis, position])
 
+  const edges = useMemo(() => new THREE.EdgesGeometry(new THREE.PlaneGeometry(30, 30)), [])
+
   return (
     <mesh position={pos} rotation={rotation}>
       <planeGeometry args={[30, 30]} />
       <meshBasicMaterial color="#00ff00" transparent opacity={0.15} side={THREE.DoubleSide} />
-      <lineSegments>
-        <edgesGeometry args={[new THREE.PlaneGeometry(30, 30)]} />
+      <lineSegments geometry={edges}>
         <lineBasicMaterial color="#00ff00" linewidth={2} />
       </lineSegments>
     </mesh>
   )
 }
 
-// Невидимая сфера-ловушка кликов для режима размещения атомов
-function PlacementCatcher({ enabled, onPoint }) {
+// Невидимая сфера-ловушка кликов для режима размещения атомов.
+// Радиус подбирается под размер решётки, чтобы клик давал точку ВНУТРИ структуры.
+function PlacementCatcher({ enabled, radius, onPoint }) {
   return (
     <mesh
       visible={false}
       onPointerDown={(e) => {
         if (!enabled) return
         e.stopPropagation()
-        onPoint([e.point.x, e.point.y, e.point.z])
+        onPoint([e.point.x, e.point.y, e.point.z], e.face ? e.face.normal : null)
       }}
     >
-      <sphereGeometry args={[60, 8, 8]} />
+      <sphereGeometry args={[radius, 32, 32]} />
       <meshBasicMaterial side={THREE.BackSide} />
     </mesh>
   )
@@ -135,7 +132,8 @@ function PlacementCatcher({ enabled, onPoint }) {
 
 function AtomScene({
   atoms, bonds, clipEnabled, clipAxis, clipPosition, showBonds, bondColor,
-  bgLight, highlightSet, selectedAtom, onAtomClick, placeMode, onPlacePoint,
+  bgLight, highlightSet, selectedAtom, substitutedSet, onAtomClick, placeMode,
+  onPlacePoint, catcherRadius,
 }) {
   const clippingPlanes = useMemo(() => {
     if (!clipEnabled) return []
@@ -159,6 +157,7 @@ function AtomScene({
           clipPlanes={clippingPlanes}
           radius={atom.type === 'H' ? 0.22 : 0.35}
           selected={selectedAtom === index}
+          substituted={!!substitutedSet && substitutedSet.has(index)}
           onClick={(e) => { e.stopPropagation(); onAtomClick(index) }}
         />
       ))}
@@ -166,23 +165,28 @@ function AtomScene({
       {/* Выделение получившегося вещества */}
       {highlightSet && atoms.map((atom, i) =>
         highlightSet.atoms.has(i) ? (
-          <Highlight key={`hl-${i}`} position={[atom.x, atom.y, atom.z]} color="#ff1493" />
+          <mesh key={`hl-${i}`} position={[atom.x, atom.y, atom.z]}>
+            <sphereGeometry args={[0.55, 16, 16]} />
+            <meshBasicMaterial color="#ff1493" wireframe transparent opacity={0.6} />
+          </mesh>
         ) : null
       )}
 
       {showBonds && bonds.map((bond, index) => (
-        <Bond
-          key={`bond-${index}`}
-          atom1={atoms[bond.atom1]}
-          atom2={atoms[bond.atom2]}
-          clipPlanes={clippingPlanes}
-          bondColor={bondColor}
-          highlighted={!!highlightSet && highlightSet.bonds.has(index)}
-        />
+        atoms[bond.atom1] && atoms[bond.atom2] ? (
+          <Bond
+            key={`bond-${index}`}
+            atom1={atoms[bond.atom1]}
+            atom2={atoms[bond.atom2]}
+            clipPlanes={clippingPlanes}
+            bondColor={bondColor}
+            highlighted={!!highlightSet && highlightSet.bonds.has(index)}
+          />
+        ) : null
       ))}
 
       {clipEnabled && <ClippingPlane axis={clipAxis} position={clipPosition} />}
-      <PlacementCatcher enabled={placeMode} onPoint={onPlacePoint} />
+      <PlacementCatcher enabled={placeMode} radius={catcherRadius} onPoint={onPlacePoint} />
 
       <ambientLight intensity={bgLight ? 0.9 : 0.6} />
       <pointLight position={[20, 20, 20]} intensity={1.5} />
@@ -193,17 +197,20 @@ function AtomScene({
 }
 
 function App() {
-  const [atoms, setAtoms] = useState([])
+  // --- базовая решётка: element/lattice/size НЕ меняются сами собой —
+  // они сбрасываются только кнопкой «Сброс» или при первой загрузке.
+  // Это чинит крах страницы после симуляции (раньше элемент сбрасывался
+  // в значение по умолчанию и падал на комбинациях вроде C-diamond). ---
+  const [element, setElement] = useState('Cu')
+  const [size, setSize] = useState(4)
+  const [lattice, setLattice] = useState('fcc')
+
+  const [baseAtoms, setBaseAtoms] = useState([])   // узлы решётки (центрированные)
   const [bonds, setBonds] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [stats, setStats] = useState({ count: 0, bondCount: 0, lattice: '' })
   const [engine, setEngine] = useState('geometry')
-
-  // Параметры структуры
-  const [element, setElement] = useState('Cu')
-  const [size, setSize] = useState(4)
-  const [lattice, setLattice] = useState('fcc')
 
   // Параметры среза
   const [clipEnabled, setClipEnabled] = useState(true)
@@ -216,12 +223,13 @@ function App() {
   const [bondColor, setBondColor] = useState('#666666')
   const [bgLight, setBgLight] = useState(false)
 
-  // Нейросеть и добавление атомов
+  // Нейросеть, замещения и добавленные атомы
   const [useNN, setUseNN] = useState(true)
   const [modelInfo, setModelInfo] = useState(null)
-  const [extraAtoms, setExtraAtoms] = useState([])
+  const [substitutions, setSubstitutions] = useState({}) // baseIndex -> символ
+  const [extraAtoms, setExtraAtoms] = useState([])       // междоузлия / свободные точки
   const [addedElement, setAddedElement] = useState('O')
-  const [placeMode, setPlaceMode] = useState(false)
+  const [mode, setMode] = useState('view')               // view | substitute | add
   const [selectedAtom, setSelectedAtom] = useState(null)
   const [molecules, setMolecules] = useState(null)
   const [highlightFormula, setHighlightFormula] = useState(null)
@@ -231,17 +239,22 @@ function App() {
   const [frameIdx, setFrameIdx] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [simLoading, setSimLoading] = useState(false)
-  const playRef = useRef(null)
 
-  // --- загрузка решётки + предсказание связей нейросетью ---
-  const fetchAtoms = useCallback(async () => {
+  // --- полный набор атомов = решётка с учётом замещений + добавленные сферы ---
+  const allAtoms = useMemo(() => {
+    const base = baseAtoms.map((a, i) =>
+      substitutions[i] ? { ...a, type: substitutions[i], substituted: true } : a)
+    return [...base, ...extraAtoms]
+  }, [baseAtoms, substitutions, extraAtoms])
+
+  // --- загрузка решётки (по элементам/размеру/типу; связи — отдельно) ---
+  const fetchLattice = useCallback(async (el, sz, lat) => {
     setLoading(true)
     setError(null)
     try {
       const response = await axios.get(`${API}/api/atoms`, {
-        params: { element, size, lattice, show_bonds: false }
+        params: { element: el, size: sz, lattice: lat, show_bonds: false }
       })
-      // центрируем решётку относительно её геометрического центра
       const xs = response.data.atoms.map(a => a.x)
       const ys = response.data.atoms.map(a => a.y)
       const zs = response.data.atoms.map(a => a.z)
@@ -251,6 +264,8 @@ function App() {
       const centered = response.data.atoms.map(a => ({
         ...a, x: a.x - cx, y: a.y - cy, z: a.z - cz
       }))
+      setBaseAtoms(centered)
+      setSubstitutions({})
       setExtraAtoms([])
       setMolecules(null)
       setSelectedAtom(null)
@@ -259,28 +274,45 @@ function App() {
       setPlaying(false)
       setMaxClipRange(Math.max(...centered.flatMap(a => [Math.abs(a.x), Math.abs(a.y), Math.abs(a.z)])) + 3)
       setClipPosition(0)
-
-      const pred = await axios.post(`${API}/api/predict_bonds`, { atoms: centered, use_nn: useNN })
-      setAtoms(centered)
-      setBonds(pred.data.bonds)
-      setEngine(pred.data.engine)
-      setStats({
-        count: centered.length,
-        bondCount: pred.data.bonds.length,
-        lattice: response.data.lattice_type
-      })
+      return centered
     } catch (err) {
-      setError('Не удалось получить данные от сервера. Проверьте, что backend запущен на порту 8000.')
+      setError(err.response?.data?.detail
+        || 'Не удалось получить данные от сервера. Проверьте, что backend запущен на порту 8000.')
       console.error(err)
+      return null
     } finally {
       setLoading(false)
     }
-  }, [element, size, lattice, useNN])
+  }, [])
 
+  // предсказание связей для набора атомов
+  const predictFor = useCallback(async (atomsList) => {
+    if (atomsList.length < 2) { setBonds([]); return [] }
+    try {
+      const pred = await axios.post(`${API}/api/predict_bonds`, { atoms: atomsList, use_nn: useNN })
+      setBonds(pred.data.bonds)
+      setEngine(pred.data.engine)
+      setStats(s => ({ ...s, count: atomsList.length, bondCount: pred.data.bonds.length }))
+      return pred.data.bonds
+    } catch (err) {
+      setError('Ошибка предсказания связей')
+      console.error(err)
+      return []
+    }
+  }, [useNN])
+
+  // первичная загрузка
   useEffect(() => {
-    const timer = setTimeout(fetchAtoms, 500)
-    return () => clearTimeout(timer)
-  }, [fetchAtoms])
+    let cancelled = false
+    fetchLattice(element, size, lattice).then(centered => {
+      if (!cancelled && centered) {
+        setStats({ count: centered.length, bondCount: 0, lattice: `${element}-${lattice}` })
+        predictFor(centered.map(a => ({ ...a })))
+      }
+    })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // информация о модели
   useEffect(() => {
@@ -289,55 +321,99 @@ function App() {
       .catch(() => setModelInfo(null))
   }, [])
 
-  // --- пересчёт связей при изменении набора атомов ---
-  const recomputeBonds = async (allAtoms) => {
-    if (allAtoms.length < 2) return
+  // пересчёт связей при изменении useNN
+  useEffect(() => {
+    if (allAtoms.length >= 2 && baseAtoms.length > 0) predictFor(allAtoms)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useNN])
+
+  // --- применение замещений/добавлений: единый вход через backend ---
+  const applyChange = async (nextSubst, nextExtra) => {
+    const base = baseAtoms.map((a, i) =>
+      nextSubst[i] ? { ...a, type: nextSubst[i] } : a)
+    const combined = [...base, ...nextExtra].map((a, i) => ({ ...a, index: i }))
+    if (combined.length < 2) return
+    setSubstitutions(nextSubst)
+    setExtraAtoms(nextExtra)
+    setMolecules(null)
+    setHighlightFormula(null)
     try {
-      const pred = await axios.post(`${API}/api/predict_bonds`, { atoms: allAtoms, use_nn: useNN })
-      setBonds(pred.data.bonds)
-      setEngine(pred.data.engine)
-      setStats(s => ({ ...s, count: allAtoms.length, bondCount: pred.data.bonds.length }))
+      await axios.post(`${API}/api/substitute`, {
+        atoms: base.map(a => ({ ...a })),
+        substitutions: Object.entries(nextSubst).map(([idx, sym]) =>
+          ({ index: Number(idx), symbol: sym })),
+        use_nn: useNN,
+      })
+      // полный пересчёт связей для решётки с примесями + добавленных сфер
+      await predictFor(combined)
     } catch (err) {
-      setError('Ошибка предсказания связей')
-      console.error(err)
+      setError('Ошибка применения изменений: ' + (err.response?.data?.detail || err.message))
     }
   }
 
-  // добавление атома в заданную точку
-  const addAtomAt = async (pos, sym) => {
-    const newAtom = { x: pos[0], y: pos[1], z: pos[2], type: sym, index: 0 }
-    const all = [...atoms, ...extraAtoms, newAtom].map((a, i) => ({ ...a, index: i }))
-    setExtraAtoms(prev => [...prev, newAtom])
-    setPlaceMode(false)
-    setSelectedAtom(all.length - 1)
-    await recomputeBonds(all)
+  // клик по атому: выделение / замещение
+  const onAtomClick = (index) => {
+    if (mode === 'substitute' && frames === null) {
+      if (index < baseAtoms.length) {
+        const next = { ...substitutions }
+        if (next[index] === addedElement) delete next[index]
+        else next[index] = addedElement
+        setSelectedAtom(index)
+        applyChange(next, extraAtoms)
+        return
+      }
+    }
+    setSelectedAtom(s => s === index ? null : index)
+  }
+
+  // проекция точки клика на ближайшую плоскость решётки (x = const)
+  const snapToLatticePlane = (p, normal) => {
+    if (!baseAtoms.length) return p
+    // средняя ориентация не нужна: просто ограничиваем координаты габаритом решётки
+    const lim = Math.max(...baseAtoms.flatMap(a => [Math.abs(a.x), Math.abs(a.y), Math.abs(a.z)]))
+    return p.map(v => Math.max(-lim, Math.min(lim, v)))
+  }
+
+  const addAtomAt = (pos, sym) => {
+    const snapped = snapToLatticePlane(pos)
+    const newAtom = { x: snapped[0], y: snapped[1], z: snapped[2], type: sym, index: 0 }
+    const nextExtra = [...extraAtoms, newAtom]
+    const allIdx = baseAtoms.length + nextExtra.length - 1
+    setSelectedAtom(allIdx)
+    setMode('view')
+    applyChange(substitutions, nextExtra)
   }
 
   const addAtomCenter = () => addAtomAt([0, 0, 0], addedElement)
 
   const removeSelected = async () => {
     if (selectedAtom === null) return
-    let keepBase = atoms
-    let keepExtra = extraAtoms
-    if (selectedAtom < atoms.length) {
-      keepBase = atoms.filter((_, i) => i !== selectedAtom)
+    if (selectedAtom < baseAtoms.length) {
+      // снять замещение с узла
+      const next = { ...substitutions }
+      delete next[selectedAtom]
+      setSelectedAtom(null)
+      await applyChange(next, extraAtoms)
     } else {
-      const extraIdx = selectedAtom - atoms.length
-      keepExtra = extraAtoms.filter((_, i) => i !== extraIdx)
+      const extraIdx = selectedAtom - baseAtoms.length
+      const nextExtra = extraAtoms.filter((_, i) => i !== extraIdx)
+      setSelectedAtom(null)
+      await applyChange(substitutions, nextExtra)
     }
-    const all = [...keepBase, ...keepExtra].map((a, i) => ({ ...a, index: i }))
-    setAtoms(keepBase)
-    setExtraAtoms(keepExtra)
-    setSelectedAtom(null)
-    setMolecules(null)
-    setHighlightFormula(null)
-    await recomputeBonds(all)
+  }
+
+  const resetStructure = () => {
+    fetchLattice(element, size, lattice).then(centered => {
+      if (centered) {
+        setStats({ count: centered.length, bondCount: 0, lattice: `${element}-${lattice}` })
+        predictFor(centered.map(a => ({ ...a })))
+      }
+    })
   }
 
   // --- анализ: какие вещества получились (связные компоненты графа связей) ---
   const analyzeSubstances = () => {
-    const all = [...atoms, ...extraAtoms]
-    const n = all.length
+    const n = allAtoms.length
     const parent = Array.from({ length: n }, (_, i) => i)
     const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i] } return i }
     const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[rb] = ra }
@@ -349,7 +425,7 @@ function App() {
     }
     const mols = Object.values(groups).map(members => {
       const counts = {}
-      members.forEach(i => { counts[all[i].type] = (counts[all[i].type] || 0) + 1 })
+      members.forEach(i => { counts[allAtoms[i].type] = (counts[allAtoms[i].type] || 0) + 1 })
       const formula = Object.entries(counts).sort().map(([el, c]) => el + (c > 1 ? c : '')).join('')
       return { formula, size: members.length, atom_indices: members.sort((a, b) => a - b) }
     }).sort((a, b) => b.size - a.size)
@@ -370,26 +446,36 @@ function App() {
     return { atoms: atomSet, bonds: bondSet }
   }, [highlightFormula, molecules, bonds])
 
+  const substitutedSet = useMemo(() => {
+    const s = new Set(Object.keys(substitutions).map(Number))
+    extraAtoms.forEach((_, i) => s.add(baseAtoms.length + i))
+    return s
+  }, [substitutions, extraAtoms, baseAtoms])
+
   // --- симуляция реакции с временной шкалой ---
   const runReaction = async () => {
     setSimLoading(true)
     setError(null)
     try {
-      const intruders = [...atoms, ...extraAtoms]
-        .filter(a => a.type !== element)
-        .map(a => [a.x, a.y, a.z])
+      // симулируем текущую структуру как есть (решётка + замещения + примеси):
+      // хозяйские атомы — самые частые, «чужие» — все остальные
+      const counts = {}
+      allAtoms.forEach(a => { counts[a.type] = (counts[a.type] || 0) + 1 })
+      const host = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0]
       const resp = await axios.post(`${API}/api/reaction`, {
-        host_element: element,
-        size: Math.min(size, 5),
+        host_element: host,
+        size,
         lattice,
-        intruder_symbol: addedElement,
-        intruder_positions: intruders.length ? intruders : [[0, 0, 0]],
+        intruder_symbol: host,
+        intruder_positions: [],
+        structure_atoms: allAtoms.map((a, i) => ({ ...a, index: i })),
+        use_nn: useNN,
         duration_ps: 10,
         steps: 60,
         temperature_K: 500,
       })
       setFrames(resp.data.frames)
-      setFrameIdx(resp.data.frames.length - 1)
+      setFrameIdx(0)
       setEngine(resp.data.engine)
       setPlaying(true)
     } catch (e) {
@@ -402,27 +488,33 @@ function App() {
   // проигрывание временной шкалы
   useEffect(() => {
     if (playing && frames) {
-      playRef.current = setInterval(() => {
+      const id = setInterval(() => {
         setFrameIdx(i => {
           if (i >= frames.length - 1) { setPlaying(false); return i }
           return i + 1
         })
       }, 120)
-      return () => clearInterval(playRef.current)
+      return () => clearInterval(id)
     }
   }, [playing, frames])
 
   // отображаемые данные: кадры симуляции или текущая структура
-  const viewAtoms = frames ? frames[frameIdx].atoms : [...atoms, ...extraAtoms]
+  const viewAtoms = frames ? frames[frameIdx].atoms : allAtoms
   const viewBonds = frames ? frames[frameIdx].bonds : bonds
   const frameMolecules = frames ? frames[frameIdx].molecules : null
+
+  const safeFrameIdx = frames ? Math.min(frameIdx, frames.length - 1) : 0
+  const catcherRadius = useMemo(() => {
+    if (!baseAtoms.length) return 15
+    return Math.max(...baseAtoms.flatMap(a => [Math.abs(a.x), Math.abs(a.y), Math.abs(a.z)])) + 2
+  }, [baseAtoms])
 
   return (
     <Box sx={{ display: 'flex', height: '100vh', width: '100vw' }}>
       {/* Панель управления */}
       <Paper
         elevation={3}
-        sx={{ width: 360, p: 3, m: 2, display: 'flex', flexDirection: 'column', gap: 2, zIndex: 10, overflowY: 'auto' }}
+        sx={{ width: 370, p: 3, m: 2, display: 'flex', flexDirection: 'column', gap: 2, zIndex: 10, overflowY: 'auto' }}
       >
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <Typography variant="h5" fontWeight="bold">⚛️ Настройки</Typography>
@@ -465,10 +557,18 @@ function App() {
           </Select>
         </FormControl>
 
+        <Button variant="outlined" size="small" onClick={resetStructure} disabled={loading}>
+          🔄 Применить / Перезагрузить решётку
+        </Button>
+        <Typography variant="caption" color="text.secondary">
+          Изменение элемента/типа решётки применяется этой кнопкой — добавленные примеси
+          и симуляция при этом не ломают страницу.
+        </Typography>
+
         <Divider sx={{ my: 1 }} />
 
-        {/* Добавление атомов */}
-        <Typography variant="subtitle1" fontWeight="bold">➕ Добавление атомов</Typography>
+        {/* Атомы другого вещества */}
+        <Typography variant="subtitle1" fontWeight="bold">➕ Атомы другого вещества</Typography>
         <FormControl fullWidth size="small">
           <InputLabel>Вставляемый атом</InputLabel>
           <Select value={addedElement} label="Вставляемый атом" onChange={(e) => setAddedElement(e.target.value)}>
@@ -480,27 +580,53 @@ function App() {
             ))}
           </Select>
         </FormControl>
+
         <Box sx={{ display: 'flex', gap: 1 }}>
-          <Button variant="contained" size="small" onClick={addAtomCenter} sx={{ flex: 1 }}>
-            ⬤ В центр куба
+          <Button
+            size="small" variant={mode === 'substitute' ? 'contained' : 'outlined'}
+            color="warning" sx={{ flex: 1 }}
+            onClick={() => setMode(m => m === 'substitute' ? 'view' : 'substitute')}
+          >
+            🔁 Заменить в решётке
           </Button>
           <Button
-            variant={placeMode ? 'outlined' : 'text'}
-            size="small"
-            color={placeMode ? 'error' : 'primary'}
-            onClick={() => setPlaceMode(v => !v)}
+            size="small" variant={mode === 'add' ? 'contained' : 'outlined'}
             sx={{ flex: 1 }}
+            onClick={() => setMode(m => m === 'add' ? 'view' : 'add')}
           >
-            {placeMode ? 'Кликните в сцене…' : '🎯 В любую точку (клик в 3D)'}
+            🎯 Добавить сферой
           </Button>
         </Box>
-        {extraAtoms.length > 0 && (
-          <Typography variant="caption" color="text.secondary">
-            Добавлено атомов: {extraAtoms.length}. Клик по атому выделяет его.
+        {mode === 'substitute' && (
+          <Typography variant="caption" color="warning.main">
+            Кликните по атому решётки — он будет замещён атомом {addedElement}.
+            Повторный клик по тому же узлу снимает замещение.
           </Typography>
         )}
-        <Button variant="outlined" size="small" color="error" disabled={selectedAtom === null} onClick={removeSelected}>
-          🗑 Удалить выбранный атом
+        {mode === 'add' && (
+          <Typography variant="caption" color="text.secondary">
+            Кликните в 3D-сцене — атом {addedElement} появится внутри объёма решётки
+            (в междоузлии). Точки вне габарита кристалла не создаются.
+          </Typography>
+        )}
+        <Button variant="text" size="small" onClick={addAtomCenter}>
+          ⬤ Вставить {addedElement} в центр куба
+        </Button>
+
+        <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+          <Typography variant="caption" color="text.secondary">
+            Замещено: {Object.keys(substitutions).length} • Междоузлий: {extraAtoms.length}
+          </Typography>
+          {(Object.keys(substitutions).length > 0 || extraAtoms.length > 0) && (
+            <Button size="small" color="secondary" variant="text"
+              onClick={() => applyChange({}, [])}>
+              Очистить всё
+            </Button>
+          )}
+        </Box>
+        <Button variant="outlined" size="small" color="error"
+          disabled={selectedAtom === null || !!frames} onClick={removeSelected}>
+          🗑 Удалить выбранное (замещение/атом)
         </Button>
 
         <Divider sx={{ my: 1 }} />
@@ -522,8 +648,9 @@ function App() {
 
         {/* Реакция / временная шкала */}
         <Typography variant="subtitle1" fontWeight="bold">⚗️ Симуляция реакции</Typography>
-        <Button variant="contained" color="secondary" onClick={runReaction} disabled={simLoading}>
-          {simLoading ? 'Расчёт…' : '▶ Запустить симуляцию внедрения атома'}
+        <Button variant="contained" color="secondary" onClick={runReaction}
+          disabled={simLoading || loading || baseAtoms.length === 0}>
+          {simLoading ? 'Расчёт…' : '▶ Запустить симуляцию'}
         </Button>
         {frames && (
           <Box>
@@ -533,11 +660,11 @@ function App() {
               </Button>
               <Button size="small" onClick={() => { setFrames(null); setPlaying(false) }}>✖ Закрыть</Button>
               <Typography variant="caption">
-                t = {frames[frameIdx].t.toFixed(1)} пс ({frameIdx + 1}/{frames.length})
+                t = {frames[safeFrameIdx].t.toFixed(1)} пс ({safeFrameIdx + 1}/{frames.length})
               </Typography>
             </Box>
             <Slider
-              value={frameIdx}
+              value={safeFrameIdx}
               onChange={(e, v) => { setPlaying(false); setFrameIdx(v) }}
               min={0} max={frames.length - 1} step={1} size="small"
               aria-label="Временная шкала"
@@ -545,7 +672,7 @@ function App() {
             {frameMolecules && (
               <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 1 }}>
                 {frameMolecules.slice(0, 6).map((m, i) => (
-                  <Chip key={i} size="small" label={`${m.formula} (${m.size})`} variant="outlined" />
+                  <Chip key={`${frameIdx}-${i}`} size="small" label={`${m.formula} (${m.size})`} variant="outlined" />
                 ))}
               </Box>
             )}
@@ -556,7 +683,7 @@ function App() {
 
         {/* Анализ веществ */}
         <Typography variant="subtitle1" fontWeight="bold">🔬 Получившиеся вещества</Typography>
-        <Button variant="outlined" size="small" onClick={analyzeSubstances}>
+        <Button variant="outlined" size="small" onClick={analyzeSubstances} disabled={!!frames}>
           Проанализировать связи → вещества
         </Button>
         {molecules && (
@@ -629,13 +756,13 @@ function App() {
         {/* Статистика */}
         <Box sx={{ mt: 'auto' }}>
           {error && <Alert severity="error" sx={{ mb: 1 }}>{error}</Alert>}
-          <Paper variant="outlined" sx={{ p: 2, bgcolor: '#f5f5f5' }}>
+          <Paper variant="outlined" sx={{ p: 2, bgcolor: bgLight ? '#f5f5f5' : '#21262d', color: bgLight ? 'inherit' : '#e6edf3' }}>
             <Typography variant="body2">📊 Статистика:</Typography>
             <Typography variant="body2">Атомов: <b>{viewAtoms.length}</b></Typography>
             <Typography variant="body2">Связей: <b>{viewBonds.length}</b></Typography>
-            <Typography variant="body2">Структура: <b>{stats.lattice}</b></Typography>
+            <Typography variant="body2">Структура: <b>{stats.lattice || '—'}</b></Typography>
             {viewAtoms.length > 0 && viewBonds.length > 0 && (
-              <Typography variant="body2" sx={{ fontSize: '0.75rem', color: '#666' }}>
+              <Typography variant="body2" sx={{ fontSize: '0.75rem', opacity: 0.7 }}>
                 Ср. связей на атом: {(viewBonds.length * 2 / viewAtoms.length).toFixed(2)}
               </Typography>
             )}
@@ -644,7 +771,7 @@ function App() {
       </Paper>
 
       {/* 3D Сцена */}
-      <Box sx={{ flexGrow: 1, position: 'relative', cursor: placeMode ? 'crosshair' : 'default' }}>
+      <Box sx={{ flexGrow: 1, position: 'relative', cursor: mode !== 'view' ? 'crosshair' : 'default' }}>
         {(loading || simLoading) && (
           <Box sx={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', zIndex: 5 }}>
             <CircularProgress size={60} />
@@ -661,15 +788,22 @@ function App() {
             bondColor={bondColor}
             bgLight={bgLight}
             highlightSet={frames ? null : highlightSet}
+            substitutedSet={frames ? null : substitutedSet}
             selectedAtom={selectedAtom}
-            onAtomClick={(i) => setSelectedAtom(s => s === i ? null : i)}
-            placeMode={placeMode}
+            onAtomClick={onAtomClick}
+            placeMode={mode === 'add'}
             onPlacePoint={(p) => addAtomAt(p, addedElement)}
+            catcherRadius={catcherRadius}
           />
         </Canvas>
-        {placeMode && (
+        {mode === 'add' && (
           <Paper sx={{ position: 'absolute', top: 10, left: '50%', transform: 'translateX(-50%)', px: 2, py: 0.5, bgcolor: 'rgba(255,20,147,0.85)', color: '#fff' }}>
-            Режим размещения: кликните в 3D-сцене, чтобы добавить атом {addedElement}
+            Режим добавления: кликните в 3D-сцене внутри решётки — атом {addedElement}
+          </Paper>
+        )}
+        {mode === 'substitute' && (
+          <Paper sx={{ position: 'absolute', top: 10, left: '50%', transform: 'translateX(-50%)', px: 2, py: 0.5, bgcolor: 'rgba(255,152,0,0.9)', color: '#fff' }}>
+            Режим замещения: кликните по атому решётки, чтобы заменить его на {addedElement}
           </Paper>
         )}
       </Box>

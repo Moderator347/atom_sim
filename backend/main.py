@@ -52,6 +52,31 @@ class PredictRequest(BaseModel):
     use_nn: bool = True  # False — геометрический алгоритм (baseline)
 
 
+class SubstitutionItem(BaseModel):
+    index: int   # индекс замещаемого атома в решётке-хозяине
+    symbol: str  # символ внедряемого элемента
+
+
+class SubstituteRequest(BaseModel):
+    """Замещение атомов в самой решётке атомами другого вещества."""
+    atoms: List[Atom]
+    substitutions: List[SubstitutionItem]
+    use_nn: bool = True
+
+
+class SiteInfo(BaseModel):
+    index: int
+    x: float
+    y: float
+    z: float
+    type: str
+
+
+class SitesResponse(BaseModel):
+    sites: List[SiteInfo]
+    count: int
+
+
 class PredictResponse(BaseModel):
     bonds: List[Bond]
     bond_count: int
@@ -75,6 +100,78 @@ class ReactionRequest(BaseModel):
     duration_ps: float = 10.0     # длительность симуляции
     steps: int = 60               # число кадров временной шкалы
     temperature_K: float = 300.0  # температура (влияет на амплитуду тепловых колебаний)
+    use_nn: Optional[bool] = None           # None — авто (NN если доступна)
+    structure_atoms: Optional[List[Atom]] = None  # точная текущая структура из фронтенда
+
+
+class LatticeParams(BaseModel):
+    """Параметры построения базовой решётки (общая логика для /api/atoms и /api/reaction)."""
+    element: str
+    size: int
+    lattice: str
+
+    def build(self):
+        """Возвращает ASE-кристалл; бросает HTTPException при некорректных параметрах."""
+        if not (1 <= self.size <= 8):
+            raise HTTPException(status_code=422, detail="Параметр size должен быть от 1 до 8")
+        supported = ("fcc", "bcc", "hcp", "diamond", "rock salt", "sc")
+
+        # Стандартные параметры решётки для элементов (Å)
+        lattice_params = {
+            "Cu": {"fcc": 3.615},
+            "Al": {"fcc": 4.05},
+            "Fe": {"bcc": 2.866, "fcc": 3.593},
+            "C": {"diamond": 3.567},
+            "Si": {"diamond": 5.431},
+            "Au": {"fcc": 4.078},
+            "Ag": {"fcc": 4.086},
+        }
+
+        if self.lattice == "sc":
+            # ASE не поддерживает crystalstructure="sc" — строим простую кубическую
+            # решётку вручную; параметр = удвоенный ковалентный радиус,
+            # чтобы атомы касались друг друга и связи корректно определялись.
+            a = 2 * ATOMIC_RADII.get(self.element, 1.0)
+            positions = [
+                [i * a, j * a, k * a]
+                for i in range(self.size)
+                for j in range(self.size)
+                for k in range(self.size)
+            ]
+            return Atoms(symbols=[self.element] * len(positions), positions=positions,
+                         cell=[self.size * a, self.size * a, self.size * a])
+
+        if self.lattice in supported:
+            try:
+                try:
+                    default_a = float(bulk(self.element).cell[0][0])
+                except Exception:
+                    default_a = None
+
+                # Физически корректный параметр для пары элемент+структура имеет приоритет.
+                a = lattice_params.get(self.element, {}).get(self.lattice)
+                if a is None:
+                    if default_a is not None:
+                        a = max(default_a, 2 * ATOMIC_RADII.get(self.element, 1.0))
+                    else:
+                        a = 2 * ATOMIC_RADII.get(self.element, 1.0)
+
+                crystal = bulk(self.element, crystalstructure=self.lattice, a=a, cubic=True)
+                crystal *= self.size
+                return crystal
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Не удалось построить решётку '{self.lattice}' для элемента "
+                           f"'{self.element}': {e}",
+                )
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неподдерживаемый тип решётки: '{self.lattice}'. Доступны: {', '.join(supported)}",
+        )
 
 
 class ReactionResponse(BaseModel):
@@ -205,6 +302,75 @@ def predict_bonds_endpoint(req: PredictRequest):
     return {"bonds": bonds, "bond_count": len(bonds), "engine": engine}
 
 
+KNOWN_ELEMENTS = set(ATOMIC_RADII) | {"Ca"}
+
+
+def build_lattice_atoms(element: str, size: int, lattice: str) -> list[dict]:
+    """Строит узлы решётки и возвращает список dict-атомов (не центрирует).
+    Общая логика для /api/atoms, /api/sites и /api/reaction."""
+    crystal = LatticeParams(element=element, size=size, lattice=lattice).build()
+    return [
+        {"x": float(a.position[0]), "y": float(a.position[1]),
+         "z": float(a.position[2]), "type": a.symbol}
+        for a in crystal
+    ]
+
+
+@app.get("/api/sites", response_model=SitesResponse)
+def get_lattice_sites(
+    element: str = Query(default="Cu"),
+    size: int = Query(default=4),
+    lattice: str = Query(default="fcc"),
+):
+    """Позиции узлов решётки (центрированные) — фронтенд использует их
+    для размещения атомов точно внутри решётки, а не вокруг неё."""
+    raw = build_lattice_atoms(element, size, lattice)
+    pts = np.array([[a['x'], a['y'], a['z']] for a in raw])
+    c = (pts.min(axis=0) + pts.max(axis=0)) / 2.0
+    sites = [
+        SiteInfo(index=i, x=round(a['x'] - c[0], 4), y=round(a['y'] - c[1], 4),
+                 z=round(a['z'] - c[2], 4), type=a['type'])
+        for i, a in enumerate(raw)
+    ]
+    return {"sites": sites, "count": len(sites)}
+
+
+@app.post("/api/substitute")
+def substitute_atoms(req: SubstituteRequest):
+    """Замещение атомов в самой решётке атомами другого вещества
+    (подстановка/примесь) с последующим предсказанием связей нейросетью."""
+    atoms_data = [a.model_dump() for a in req.atoms]
+    if not atoms_data:
+        raise HTTPException(status_code=422, detail="Список атомов пуст")
+
+    for s in req.substitutions:
+        if not (0 <= s.index < len(atoms_data)):
+            raise HTTPException(status_code=422,
+                                detail=f"Индекс узла {s.index} вне диапазона")
+        sym = s.symbol.capitalize() if len(s.symbol) > 1 else s.symbol.upper()
+        if sym not in KNOWN_ELEMENTS:
+            raise HTTPException(status_code=422,
+                                detail=f"Неизвестный элемент '{s.symbol}'")
+        atoms_data[s.index]['type'] = sym
+
+    for i, a in enumerate(atoms_data):
+        a['index'] = i
+
+    positions = np.array([[a['x'], a['y'], a['z']] for a in atoms_data])
+    candidates = find_candidate_pairs(atoms_data)
+
+    if req.use_nn and NN_AVAILABLE:
+        bonds = nn_model.predict_bonds(atoms_data, positions, candidates)
+        engine = "neural_network"
+    else:
+        bonds = calculate_bonds(atoms_data)
+        engine = "geometry"
+
+    molecules = detect_molecules(atoms_data, bonds)
+    return {"atoms": atoms_data, "bonds": bonds, "engine": engine,
+            "bond_count": len(bonds), "molecules": molecules}
+
+
 @app.post("/api/train_model")
 def train_model_endpoint(epochs: int = Query(default=8, ge=1, le=50)):
     """Явная перетренировка нейросетевой модели предсказания связей."""
@@ -243,57 +409,41 @@ def model_info():
 def simulate_reaction(req: ReactionRequest):
     """Упрощённая молекулярная симуляция с временной шкалой.
 
-    Строит хозяйскую решётку, помещает в неё атомы другого вещества,
-    затем на каждом шаге добавляет тепловые смещения позиций и заново
-    предсказывает связи (нейросетью либо геометрически). Связные
-    компоненты графа связей трактуются как получившиеся «вещества»."""
-    if not (1 <= req.size <= 6):
-        raise HTTPException(status_code=422, detail="Параметр size должен быть от 1 до 6")
+    Если передан structure_atoms — симулируется ровно текущая структура
+    фронтенда (решётка + замещения + добавленные атомы). Иначе строится
+    хозяйская решётка и в неё помещаются «чужие» атомы. На каждом шаге
+    добавляются тепловые смещения позиций, связи заново предсказываются
+    (нейросетью либо геометрически), а связные компоненты графа связей
+    трактуются как получившиеся «вещества»."""
     if not (10 <= req.steps <= 200):
         raise HTTPException(status_code=422, detail="Параметр steps должен быть от 10 до 200")
 
-    supported = ("fcc", "bcc", "hcp", "diamond", "rock salt", "sc")
-    host = req.host_element
     rng = np.random.default_rng(1234)
 
-    # --- построение базовой структуры ---
-    base_atoms = []
-    if req.lattice == "sc":
-        a = 2 * ATOMIC_RADII.get(host, 1.0)
-        positions = [[i * a, j * a, k * a]
-                     for i in range(req.size) for j in range(req.size) for k in range(req.size)]
-        crystal = Atoms(symbols=[host] * len(positions), positions=positions)
-    elif req.lattice in supported:
-        try:
-            a = float(bulk(host).cell[0][0])
-        except Exception:
-            a = 2 * ATOMIC_RADII.get(host, 1.0)
-        a = max(a, 2 * ATOMIC_RADII.get(host, 1.0))
-        try:
-            crystal = bulk(host, crystalstructure=req.lattice, a=a, cubic=True)
-            crystal *= req.size
-        except Exception as e:
-            raise HTTPException(status_code=400,
-                                detail=f"Не удалось построить решётку '{req.lattice}' для '{host}': {e}")
+    # --- базовая структура ---
+    if req.structure_atoms:
+        base_atoms = [a.model_dump() for a in req.structure_atoms]
+        host = req.host_element
     else:
-        raise HTTPException(status_code=400,
-                            detail=f"Неподдерживаемый тип решётки: '{req.lattice}'")
+        crystal = LatticeParams(element=req.host_element, size=req.size,
+                                lattice=req.lattice).build()
+        base_atoms = []
+        for pos in crystal.positions:
+            base_atoms.append({"x": float(pos[0]), "y": float(pos[1]),
+                               "z": float(pos[2]), "type": req.host_element})
 
-    for pos in crystal.positions:
-        base_atoms.append({"x": float(pos[0]), "y": float(pos[1]),
-                           "z": float(pos[2]), "type": host})
+        # центрируем относительно геометрического центра — удобно для фронтенда
+        center = np.mean([[a['x'], a['y'], a['z']] for a in base_atoms], axis=0)
+        for atom in base_atoms:
+            atom['x'] -= center[0]; atom['y'] -= center[1]; atom['z'] -= center[2]
 
-    # центрируем относительно геометрического центра — удобно для фронтенда
-    center = np.mean([[a['x'], a['y'], a['z']] for a in base_atoms], axis=0)
-    for atom in base_atoms:
-        atom['x'] -= center[0]; atom['y'] -= center[1]; atom['z'] -= center[2]
-
-    # вставляем «чужие» атомы (по умолчанию — в центр куба)
-    for p in req.intruder_positions:
-        if len(p) != 3:
-            raise HTTPException(status_code=422, detail="Каждая позиция intruder — [x, y, z]")
-        base_atoms.append({"x": float(p[0]), "y": float(p[1]),
-                           "z": float(p[2]), "type": req.intruder_symbol})
+        # вставляем «чужие» атомы (по умолчанию — в центр куба)
+        for p in req.intruder_positions:
+            if len(p) != 3:
+                raise HTTPException(status_code=422, detail="Каждая позиция intruder — [x, y, z]")
+            base_atoms.append({"x": float(p[0]), "y": float(p[1]),
+                               "z": float(p[2]), "type": req.intruder_symbol})
+        host = req.host_element
 
     for i, atom in enumerate(base_atoms):
         atom['index'] = i
@@ -301,12 +451,13 @@ def simulate_reaction(req: ReactionRequest):
     base_pos = np.array([[a['x'], a['y'], a['z']] for a in base_atoms])
     candidates = find_candidate_pairs(base_atoms)
 
-    use_nn = NN_AVAILABLE
+    use_nn = NN_AVAILABLE if req.use_nn is None else (req.use_nn and NN_AVAILABLE)
     engine = "neural_network" if use_nn else "geometry"
 
     # амплитуда теплового смещения: ~0.01 Å при 300 K; масштабируется sqrt(T/m)
     mass = {'H': 1, 'C': 12, 'N': 14, 'O': 16, 'Si': 28, 'Cu': 63.5,
-            'Al': 27, 'Fe': 56, 'Au': 197, 'Ag': 108}.get(host, 50)
+            'Al': 27, 'Fe': 56, 'Au': 197, 'Ag': 108, 'Zn': 65,
+            'Ni': 59, 'Co': 59, 'Ca': 40}.get(host, 50)
     amp = 0.01 * (300.0 / mass) ** 0.5 * (req.temperature_K / 300.0) ** 0.5
 
     frames = []
@@ -348,70 +499,7 @@ def get_atoms(
     show_bonds: bool = Query(default=True, description="Показывать связи")
 ):
     """Генерирует кристаллическую решетку с расчётом связей"""
-    # Валидация параметров
-    if not (1 <= size <= 10):
-        raise HTTPException(status_code=422, detail="Параметр size должен быть от 1 до 10")
-
-    supported_structures = ("fcc", "bcc", "hcp", "diamond", "rock salt", "sc")
-
-    # Стандартные параметры решётки для элементов (Å)
-    lattice_params = {
-        "Cu": {"fcc": 3.615},
-        "Al": {"fcc": 4.05},
-        "Fe": {"bcc": 2.866, "fcc": 3.593},
-        "C": {"diamond": 3.567},
-        "Si": {"diamond": 5.431},
-        "Au": {"fcc": 4.078},
-        "Ag": {"fcc": 4.086},
-    }
-
-    if lattice == "sc":
-        # ASE не поддерживает crystalstructure="sc" — строим простую кубическую решётку вручную.
-        # Параметр решётки берём равным удвоенному ковалентному радиусу элемента,
-        # чтобы атомы касались друг друга и связи корректно определялись.
-        a = 2 * ATOMIC_RADII.get(element, 1.0)
-        positions = [
-            [i * a, j * a, k * a]
-            for i in range(size)
-            for j in range(size)
-            for k in range(size)
-        ]
-        crystal = Atoms(symbols=[element] * len(positions), positions=positions,
-                        cell=[size * a, size * a, size * a])
-    elif lattice in supported_structures:
-        try:
-            # Стандартный параметр решётки для элемента (из справочных данных ASE),
-            # если он есть; иначе — из таблицы ниже.
-            try:
-                default_a = float(bulk(element).cell[0][0])
-            except Exception:
-                default_a = None
-
-            # Физически корректный параметр для конкретной пары элемент+структура имеет приоритет.
-            # В остальных случаях берём стандартный параметр, но не меньше удвоенного
-            # ковалентного радиуса атома (иначе атомы «не касаются» друг друга
-            # и связи между ними не будут определены).
-            a = lattice_params.get(element, {}).get(lattice)
-            if a is None:
-                if default_a is not None:
-                    a = max(default_a, 2 * ATOMIC_RADII.get(element, 1.0))
-                else:
-                    a = 2 * ATOMIC_RADII.get(element, 1.0)
-
-            crystal = bulk(element, crystalstructure=lattice, a=a, cubic=True)
-            crystal *= size
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Не удалось построить решётку '{lattice}' для элемента '{element}': {e}",
-            )
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Неподдерживаемый тип решётки: '{lattice}'. Доступны: {', '.join(supported_structures)}",
-        )
+    crystal = LatticeParams(element=element, size=size, lattice=lattice).build()
 
     atoms_data = []
     for i, atom in enumerate(crystal):
